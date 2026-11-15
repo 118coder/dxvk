@@ -11,6 +11,10 @@ on:
   workflow_dispatch:
   push:
     branches: [auto-release]
+    # 只改工作流或文档不触发重新构建
+    paths-ignore:
+      - '.github/**'
+      - '**.md'
 
 # 推送同步结果、打 tag、创建 Release 都需要写权限
 permissions:
@@ -61,7 +65,8 @@ jobs:
 
       - name: 计算版本号
         run: |
-          VERSION=$(git describe --tags --abbrev=8 | sed 's/^v//')
+          # 只参考官方的 v* 标签，避免我们自己打的 auto-* 标签混进版本号
+          VERSION=$(git describe --tags --match 'v*' --abbrev=8 | sed 's/^v//')
           HEAD_SHA=$(git rev-parse HEAD)
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
