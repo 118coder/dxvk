@@ -1,0 +1,98 @@
+name: Auto release (sync upstream + build)
+
+# 定时检查官方仓库 master，有更新就同步过来，然后云端编译打包并发布 Release。
+# 触发方式：
+#   1. 定时：UTC 每 6 小时（北京时间 08:00 / 14:00 / 20:00 / 02:00）
+#   2. 手动：Actions 页面 -> Auto release -> Run workflow
+#   3. 手动 push 到 auto-release 分支也会触发
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [auto-release]
+
+# 推送同步结果、打 tag、创建 Release 都需要写权限
+permissions:
+  contents: write
+
+# 防止定时任务和手动触发重叠跑
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-latest
+    # 与官方仓库 .github/workflows/artifacts.yml 完全相同的构建环境
+    container: archlinux/archlinux:base-devel
+    steps:
+      - name: 安装构建依赖（与官方 CI 相同）
+        run: |
+          pacman -Syu --needed --noconfirm git meson mingw-w64-gcc glslang hwdata
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout auto-release 分支
+        uses: actions/checkout@v6
+        with:
+          ref: auto-release
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: 同步上游 master（仅快进，不产生额外提交）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/doitsujin/dxvk.git
+          git fetch upstream master --tags
+          BEFORE=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor HEAD upstream/master; then
+            git merge --ff-only upstream/master
+          else
+            echo "::warning::本地分支与上游历史分叉，跳过同步，按当前代码构建"
+          fi
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" != "$AFTER" ]; then
+            echo "上游有更新: $BEFORE -> $AFTER，推送同步结果"
+            git push origin auto-release
+          else
+            echo "上游无新提交"
+          fi
+
+      - name: 计算版本号
+        run: |
+          VERSION=$(git describe --tags --abbrev=8 | sed 's/^v//')
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "HEAD_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
+          echo "本次版本: $VERSION (commit $HEAD_SHA)"
+
+      - name: 检查该版本是否已发布过（避免重复构建）
+        run: |
+          if git ls-remote --exit-code origin "refs/tags/auto-${VERSION}" >/dev/null 2>&1; then
+            echo "auto-${VERSION} 已发布过，跳过"
+            echo "SKIP=true" >> "$GITHUB_ENV"
+          else
+            echo "SKIP=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: 构建 + 打包（官方 package-release.sh，产物与官方发行包一致）
+        if: env.SKIP == 'false'
+        run: ./package-release.sh "${VERSION}" build
+
+      - name: 发布 Release
+        if: env.SKIP == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: auto-${{ env.VERSION }}
+          name: DXVK ${{ env.VERSION }}
+          target_commitish: ${{ env.HEAD_SHA }}
+          make_latest: "true"
+          fail_on_unmatched_files: true
+          files: build/dxvk-${{ env.VERSION }}.tar.gz
+          body: |
+            由 GitHub Actions 自动同步上游 master 后编译打包，内容与官方发行包一致。
+
+            - 版本 `${{ env.VERSION }}`：最新正式版 + 领先的提交数 + 提交短哈希
+            - 对应上游提交：https://github.com/doitsujin/dxvk/commit/${{ env.HEAD_SHA }}
+            - 使用官方仓库自带的 `package-release.sh` 打包（x64 + x32 + 安装脚本）
